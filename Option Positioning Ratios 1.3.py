@@ -132,4 +132,4 @@ def main(ticker):
         
     print(f"Average Open Interest Ratio: {avg_open_interest_ratio:.2f}")
 
-main("RKLB")
+main("QQQ")
