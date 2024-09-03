@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from scipy.stats import norm
+
+def fetch_option_chain(ticker):
+    stock = yf.Ticker(ticker)
+    option_dates = stock.options
+    current_date = datetime.now().date()
+    valid_dates = [date for date in option_dates if datetime.strptime(date, '%Y-%m-%d').date() > current_date]
+    if not valid_dates:
+        raise ValueError("No valid expiration dates available.")
+    option_chain = stock.option_chain(valid_dates[0])
+    return option_chain.calls, option_chain.puts, stock, valid_dates[0]
+
+def fetch_vix():
+    vix = yf.Ticker("^VIX")
+    vix_data = vix.history(period='1d')
+    return vix_data['Close'].iloc[-1]
+
+def get_historical_levels(ticker, days=30):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    history = yf.Ticker(ticker).history(start=start_date, end=end_date)
+    return history['High'].max(), history['Low'].min()
+
+def get_risk_free_rate():
+    # You could implement a function to fetch the current risk-free rate
+    # For now, we'll use a more realistic fixed rate
+    return 0.05  # 5% as an example
+
+def calculate_time_to_expiry(expiry_date):
+    expiry = datetime.strptime(expiry_date, '%Y-%m-%d')
+    now = datetime.now()
+    days_to_expiry = (expiry - now).days
+    return max(days_to_expiry / 365.0,1/365,2/365,3/365,4/365,5/365,6/365,7/365)  # Ensure at least 1 day (1/365) to avoid division by zero
+
+def black_scholes_greeks(S, K, T, r, sigma, option_type):
+    N = norm.cdf
+    N_prime = norm.pdf
+  
+    if T <= 0 or sigma <= 0:
+        return 0, 0, 0, 0  # Return zeros if we can't calculate
+  
+    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+  
+    if option_type == 'call':
+        delta = N(d1)
+        theta = -(S*N_prime(d1)*sigma)/(2*np.sqrt(T)) - r*K*np.exp(-r*T)*N(d2)
+    else:  # put
+        delta = N(d1) - 1
+        theta = -(S*N_prime(d1)*sigma)/(2*np.sqrt(T)) + r*K*np.exp(-r*T)*N(-d2)
+  
+    gamma = N_prime(d1) / (S*sigma*np.sqrt(T))
+    vega = S * np.sqrt(T) * N_prime(d1)
+  
+    return delta, gamma, theta, vega
+
+def calculate_greeks(row, S, r, T, option_type):
+    K = row['strike']
+    sigma = row['impliedVolatility']
+    delta, gamma, theta, vega = black_scholes_greeks(S, K, T, r, sigma, option_type)
+    return pd.Series({'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega})
+
+def get_enhanced_levels(calls, puts, spot_price, historical_high, historical_low, r, T, oi_threshold=1500):
+    calls['option_type'] = 'call'
+    puts['option_type'] = 'put'
+  
+    calls[['delta', 'gamma', 'theta', 'vega']] = calls.apply(lambda row: calculate_greeks(row, spot_price, r, T, 'call'), axis=1)
+    puts[['delta', 'gamma', 'theta', 'vega']] = puts.apply(lambda row: calculate_greeks(row, spot_price, r, T, 'put'), axis=1)
+  
+    call_levels = calls[calls['openInterest'] > oi_threshold]
+    put_levels = puts[puts['openInterest'] > oi_threshold]
+  
+    resistance_levels = call_levels[call_levels['strike'] > spot_price].sort_values('strike')
+    support_levels = put_levels[put_levels['strike'] < spot_price].sort_values('strike', ascending=False)
+  
+    resistance_levels['score'] = resistance_levels.apply(lambda row: calculate_level_score(row, 'call', spot_price, historical_high), axis=1)
+    support_levels['score'] = support_levels.apply(lambda row: calculate_level_score(row, 'put', spot_price, historical_low), axis=1)
+  
+    return support_levels.sort_values('score', ascending=False), resistance_levels.sort_values('score', ascending=False)
+
+def calculate_level_score(row, option_type, spot_price, historical_level):
+    oi_score = row['openInterest'] / 1000  # Normalize OI
+    volume_score = row['volume'] / 500  # Normalize volume
+    iv_score = row['impliedVolatility'] * 100  # Scale up IV for better weighting
+  
+    delta_score = abs(row['delta']) * 1000  # Higher delta (closer to ATM) increases score
+    gamma_score = row['gamma'] * 10000  # Higher gamma (more reactive) increases score
+    vega_score = row['vega'] * 100  # Higher vega (more sensitive to volatility) increases score
+    theta_score = abs(row['theta']) * 100  # Higher theta (faster time decay) increases score
+  
+    if option_type == 'call':
+        price_distance = (row['strike'] - spot_price) / spot_price
+        historical_distance = abs(row['strike'] - historical_level) / historical_level
+    else:  # put
+        price_distance = (spot_price - row['strike']) / spot_price
+        historical_distance = abs(historical_level - row['strike']) / historical_level
+  
+    distance_score = 1 / (1 + price_distance)  # Inverse distance, closer is better
+    historical_score = 1 / (1 + historical_distance)  # Inverse distance from historical level
+  
+    return oi_score + volume_score + iv_score + distance_score + historical_score + delta_score + gamma_score + vega_score + theta_score
+
+def get_live_spot_price(ticker):
+    stock = yf.Ticker(ticker)
+    live_data = stock.history(period='1d')
+    return live_data['Close'].iloc[-1]
+
+def print_enhanced_levels(support_levels, resistance_levels, spot_price, historical_low, historical_high):
+    print(f"\nCurrent Spot Price: ${spot_price:.2f}")
+    print(f"30-day Low: ${historical_low:.2f}")
+    print(f"30-day High: ${historical_high:.2f}")
+  
+    print("\nTop 5 Support Levels:")
+    if support_levels.empty:
+        print("No significant support levels found.")
+    else:
+        for _, row in support_levels.head().iterrows():
+            print(f"${row['strike']:.2f} (Put OI: {row['openInterest']:.0f}, Volume: {row['volume']:.0f}, "
+                  f"IV: {row['impliedVolatility']:.2f}, Delta: {row['delta']:.2f}, Gamma: {row['gamma']:.6f}, "
+                  f"Theta: {row['theta']:.2f}, Vega: {row['vega']:.2f}, Score: {row['score']:.2f})")
+          
+    print("\nTop 5 Resistance Levels:")
+    if resistance_levels.empty:
+        print("No significant resistance levels found.")
+    else:
+        for _, row in resistance_levels.head().iterrows():
+            print(f"${row['strike']:.2f} (Call OI: {row['openInterest']:.0f}, Volume: {row['volume']:.0f}, "
+                  f"IV: {row['impliedVolatility']:.2f}, Delta: {row['delta']:.2f}, Gamma: {row['gamma']:.6f}, "
+                  f"Theta: {row['theta']:.2f}, Vega: {row['vega']:.2f}, Score: {row['score']:.2f})")
+          
+def main(ticker):
+    calls, puts, stock, expiry_date = fetch_option_chain(ticker)
+    vix_current = fetch_vix()
+    spot_price = get_live_spot_price(ticker)
+    historical_high, historical_low = get_historical_levels(ticker)
+  
+    r = get_risk_free_rate()
+    T = calculate_time_to_expiry(expiry_date)
+  
+    print(f"Spot price: {spot_price}")
+    print(f"Risk-free rate: {r}")
+    print(f"Time to expiry: {T}")
+    print(f"Expiry date: {expiry_date}")
+  
+    support_levels, resistance_levels = get_enhanced_levels(calls, puts, spot_price, historical_high, historical_low, r, T)
+  
+    print(f"Current VIX: {vix_current:.2f}")
+    print_enhanced_levels(support_levels, resistance_levels, spot_price, historical_low, historical_high)
+  
+  
+if __name__ == "__main__":
+    ticker = "SPY"  # Example ticker
+    main(ticker)
